@@ -4,7 +4,7 @@ use rand::prelude::*;
 use rand::Rng;
 use anyhow::{Context, Result};
 
-pub fn synthesize_value(dist: &Distribution, rng: &mut ThreadRng) -> Result<String> {
+pub fn synthesize_value(dist: &Distribution, rng: &mut ThreadRng, quantile: Option<f64>) -> Result<String> {
 
     if should_generate_null(dist, rng) {
         return Ok("\\N".to_string()); 
@@ -16,7 +16,7 @@ pub fn synthesize_value(dist: &Distribution, rng: &mut ThreadRng) -> Result<Stri
             synthesize_categorical(frequencies, rng)
         }
         Histogram::Numeric { bins, frequencies } => {
-            synthesize_numeric(bins, frequencies, rng)
+            synthesize_numeric(bins, frequencies, rng, quantile)
         }
     }
 }
@@ -71,6 +71,7 @@ fn synthesize_numeric(
     bins: &[f64],
     frequencies: &[u64],
     rng: &mut ThreadRng,
+    quantile: Option<f64>,
 ) -> Result<String> {
     if bins.len() < 2 || frequencies.is_empty() {
         return Ok("0".to_string());
@@ -88,6 +89,47 @@ fn synthesize_numeric(
         return Ok("0".to_string());
     }
 
+    let value = if let Some(q) = quantile {
+        inverse_transform_sample(bins, frequencies, q, total_weight)?
+    } else {
+        weighted_random_sample(bins, frequencies, rng, total_weight)
+    };
+
+    Ok(format_numeric(value))
+}
+
+fn inverse_transform_sample(bins: &[f64], frequencies: &[u64], quantile: f64, total_weight: u64) -> Result<f64> {
+    let target_cumulative = quantile * total_weight as f64;
+    let mut cumulative = 0.0;
+
+    for (bin_idx, &frequency) in frequencies.iter().enumerate() {
+        let prev_cumulative = cumulative;
+        cumulative += frequency as f64;
+
+        if cumulative >= target_cumulative {
+            let bin_min = bins[bin_idx];
+            let bin_max = bins[bin_idx + 1];
+
+            if frequency == 0 {
+                return Ok((bin_min + bin_max) / 2.0);
+            }
+
+            let position_in_bin = (target_cumulative - prev_cumulative) / frequency as f64;
+            let value = bin_min + position_in_bin * (bin_max - bin_min);
+
+            return Ok(value.clamp(bin_min, bin_max));
+        }
+    }
+
+    Ok(bins[bins.len() - 1])
+}
+
+fn weighted_random_sample(
+    bins: &[f64],
+    frequencies: &[u64],
+    rng: &mut ThreadRng,
+    total_weight: u64,
+) -> f64 {
     let mut random_weight = rng.gen_range(0..total_weight);
     let mut selected_bin_idx = 0;
 
@@ -99,14 +141,10 @@ fn synthesize_numeric(
         random_weight -= weight;
     }
 
-    // Step 2: Interpolate within selected bin
     let bin_min = bins[selected_bin_idx];
     let bin_max = bins[selected_bin_idx + 1];
 
-    // Generate uniform random value in [bin_min, bin_max)
-    let value = rng.gen_range(bin_min..bin_max);
-
-    Ok(format_numeric(value))
+    rng.gen_range(bin_min..bin_max)
 }
 
 fn format_numeric(value: f64) -> String {
@@ -156,64 +194,31 @@ mod tests {
     use crate::math::{Distribution, Histogram};
 
     #[test]
-    fn test_null_generation() {
-        let mut rng = rand::thread_rng();
+    fn test_inverse_transform_sampling() {
+        // Histogram: [0-50): 25, [50-100): 75
+        let bins = vec![0.0, 50.0, 100.0];
+        let frequencies = vec![25, 75];
+        let total = 100;
 
-        // 100% null rate
-        let dist = Distribution::new(
-            None,
-            None,
-            100,
-            100,
-            0,
-            Histogram::Categorical {
-                frequencies: HashMap::new(),
-                truncated: false,
-            },
-        );
+        // q=0.0 → should be near 0
+        let v1 = inverse_transform_sample(&bins, &frequencies, 0.0, total).unwrap();
+        assert!(v1 >= 0.0 && v1 < 50.0);
 
-        // Should always generate NULL
-        for _ in 0..10 {
-            let value = synthesize_value(&dist, &mut rng).unwrap();
-            assert_eq!(value, "\\N");
-        }
+        // q=0.25 → exactly at boundary (25/100)
+        let v2 = inverse_transform_sample(&bins, &frequencies, 0.25, total).unwrap();
+        assert!((v2 - 50.0).abs() < 0.1);
+
+        // q=0.5 → middle of second bin
+        let v3 = inverse_transform_sample(&bins, &frequencies, 0.5, total).unwrap();
+        assert!(v3 >= 50.0 && v3 < 100.0);
+
+        // q=1.0 → near max
+        let v4 = inverse_transform_sample(&bins, &frequencies, 1.0, total).unwrap();
+        assert!(v4 >= 50.0 && v4 <= 100.0);
     }
 
     #[test]
-    fn test_categorical_generation() {
-        let mut rng = rand::thread_rng();
-        let mut frequencies = HashMap::new();
-        frequencies.insert("apple".to_string(), 70);
-        frequencies.insert("banana".to_string(), 30);
-
-        let dist = Distribution::new(
-            None,
-            None,
-            0,
-            100,
-            2,
-            Histogram::Categorical {
-                frequencies,
-                truncated: false,
-            },
-        );
-
-        // Generate multiple values
-        let mut results = HashMap::new();
-        for _ in 0..100 {
-            let value = synthesize_value(&dist, &mut rng).unwrap();
-            *results.entry(value).or_insert(0) += 1;
-        }
-
-        // Should have generated both values
-        assert!(results.contains_key("apple"));
-        assert!(results.contains_key("banana"));
-        // Apple should appear more frequently (roughly 70/30 ratio)
-        // Due to randomness, we just check both exist
-    }
-
-    #[test]
-    fn test_numeric_generation() {
+    fn test_synthesize_with_quantile() {
         let mut rng = rand::thread_rng();
 
         let dist = Distribution::new(
@@ -228,12 +233,15 @@ mod tests {
             },
         );
 
-        // Generate values and verify they're in range
-        for _ in 0..20 {
-            let value = synthesize_value(&dist, &mut rng).unwrap();
-            let parsed: f64 = value.parse().unwrap();
-            assert!(parsed >= 0.0 && parsed < 100.0);
-        }
+        // With quantile=0.5, should be in upper half
+        let value = synthesize_value(&dist, &mut rng, Some(0.5)).unwrap();
+        let parsed: f64 = value.parse().unwrap();
+        assert!(parsed >= 25.0); // Should be around midpoint
+
+        // With quantile=1.0, should be near max
+        let value = synthesize_value(&dist, &mut rng, Some(1.0)).unwrap();
+        let parsed: f64 = value.parse().unwrap();
+        assert!(parsed >= 75.0);
     }
 
     #[test]

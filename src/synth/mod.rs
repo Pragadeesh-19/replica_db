@@ -4,8 +4,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use crate::genome::DatabaseGenome;
 use anyhow::{bail, Context, Result};
-use rand::thread_rng;
+use rand::rngs::StdRng;
+use rand::{thread_rng, SeedableRng};
 use tracing::{debug, info, warn};
+use crate::copula::GaussianCopula;
 use crate::order::calculate_execution_order;
 use crate::schema::{ForeignKey, Table};
 use crate::synth::strategy::synthesize_primary_key;
@@ -35,6 +37,7 @@ pub struct Synthesizer {
     genome: Arc<DatabaseGenome>,
     execution_order: Vec<String>,
     config: SynthesisConfig,
+    copulas: HashMap<String, Arc<GaussianCopula>>,
 }
 
 impl Synthesizer {
@@ -51,10 +54,40 @@ impl Synthesizer {
             execution_order
         );
 
+        let mut copulas = HashMap::new();
+
+        for (table_name, cov_matrix) in &genome.correlations {
+            match GaussianCopula::new(cov_matrix) {
+                Ok(copula ) => {
+                    debug!(
+                        table = %table_name,
+                        dimensions = copula.dimension(),
+                        "Initialized gausian copula for correlated sampling"
+                    );
+                    copulas.insert(table_name.clone(), Arc::new(copula));
+                }
+                Err(e) => {
+                    warn!(
+                        table = %table_name,
+                        error = %e,
+                        "Singular matrix or invalid correlation for table, falling back to independent sampling"
+                    );
+                }
+            }
+        }
+
+        if !copulas.is_empty() {
+            info!(
+                copulas = copulas.len(),
+                "Initialized {} gaussian copulas for multivariate synthesis",
+                copulas.len()
+            );
+        }
         Ok(Self {
             genome: Arc::new(genome),
             execution_order,
             config,
+            copulas,
         })
     }
 
@@ -109,7 +142,12 @@ impl Synthesizer {
         // Validate FK dependencies first
         self.validate_foreign_key_dependencies(table, key_store)?;
 
-        let mut rng = thread_rng();
+        let mut rng: Box<dyn rand::RngCore> = if let Some(seed) = self.config.seed {
+            Box::new(StdRng::seed_from_u64(seed))
+        } else {
+            Box::new(thread_rng())
+        };
+
         let mut primary_key_counter: i64 = 0;
         let mut primary_key_values: Vec<PrimaryKeyValue> = Vec::new();
 
@@ -124,8 +162,24 @@ impl Synthesizer {
             .map(|fk| (fk.source_col.as_str(), fk))
             .collect();
 
+        let copula = self.copulas.get(&table.name);
+        if copula.is_some() {
+            debug!(
+                table = %table.name,
+                "Using Gaussian copula for correlated column generation"
+            );
+        }
+
         // Generate rows
         for _ in 0..self.config.rows_per_table {
+
+            let correlated_quantities: Option<HashMap<String, f64>> = if let Some(cop) = copula {
+                let uniforms = cop.generate_correlated_uniforms(&mut thread_rng());
+                Some(cop.columns().iter().cloned().zip(uniforms).collect())
+            } else {
+                None
+            };
+
             let mut row_values: Vec<String> = Vec::with_capacity(table.columns.len());
 
             for column in &table.columns {
@@ -143,7 +197,7 @@ impl Synthesizer {
                             column.name
                         ))?;
 
-                    strategy::synthesize_foreign_key(parent_keys, &mut rng)
+                    strategy::synthesize_foreign_key(parent_keys, &mut thread_rng())
                         .context(format!(
                             "Failed to generate FK '{}' from parent '{}'",
                             column.name,
@@ -158,7 +212,10 @@ impl Synthesizer {
                             column.name
                         ))?;
 
-                    strategy::synthesize_value(distribution, &mut rng)
+                    let quantile = correlated_quantities.as_ref()
+                        .and_then(|q_map| q_map.get(&column.name).copied());
+
+                    strategy::synthesize_value(distribution, &mut thread_rng(), quantile)
                         .context(format!(
                             "Failed to synthesize value for column '{}.{}'",
                             table.name,
@@ -230,7 +287,6 @@ impl GenerationResult {
         self.table_data.values().map(|t| t.row_count).sum()
     }
 
-    /// Returns data for a specific table.
     pub fn get_table_data(&self, table_name: &str) -> Option<&TableData> {
         self.table_data.get(table_name)
     }

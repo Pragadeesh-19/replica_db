@@ -99,9 +99,9 @@ async fn main() -> Result<()> {
 }
 
 async fn scan_database(url: &str, output_path: &str, parallel_jobs: usize) -> Result<()> {
-    eprintln!("🔍 GhostForge Scanner");
+    eprintln!("replica_db Scanner");
 
-    eprintln!("📡 Connecting to database...");
+    eprintln!("Connecting to database...");
     let pool = PgPoolOptions::new()
         .max_connections(20)
         .acquire_timeout(Duration::from_secs(30))
@@ -109,7 +109,7 @@ async fn scan_database(url: &str, output_path: &str, parallel_jobs: usize) -> Re
         .await
         .context("Failed to connect to database")?;
 
-    eprintln!("✓ Connected");
+    eprintln!("Connected");
 
     let multi_progress = MultiProgress::new();
 
@@ -129,7 +129,7 @@ async fn scan_database(url: &str, output_path: &str, parallel_jobs: usize) -> Re
     introspect_spinner.finish_with_message(format!("✓ Discovered {} tables", tables.len()));
 
     if tables.is_empty() {
-        eprintln!("⚠️  No tables found in database");
+        eprintln!("No tables found in database");
         return Ok(());
     }
 
@@ -140,16 +140,16 @@ async fn scan_database(url: &str, output_path: &str, parallel_jobs: usize) -> Re
         .context("Failed to profile tables")?;
 
     eprintln!(
-        "\n✓ Profiled {} columns across {} tables",
+        "\nProfiled {} columns across {} tables",
         all_distributions.len(),
         tables.len()
     );
 
     if !all_correlations.is_empty() {
-        eprintln!("✓ Computed correlations for {} tables", all_correlations.len());
+        eprintln!("Computed correlations for {} tables", all_correlations.len());
     }
 
-    eprintln!("\n💾 Creating genome...");
+    eprintln!("\nCreating genome...");
 
     let genome = DatabaseGenome::with_correlations(
         tables,
@@ -170,7 +170,7 @@ async fn scan_database(url: &str, output_path: &str, parallel_jobs: usize) -> Re
         .map(|m| m.len())
         .unwrap_or(0);
 
-    eprintln!("✓ Genome saved to: {}", output_path);
+    eprintln!("Genome saved to: {}", output_path);
     eprintln!(
         "  Size: {} KB ({} tables, {} columns)",
         file_size / 1024,
@@ -237,9 +237,9 @@ async fn profile_tables_parallel(
 
                 //Update progress message to show correlation status
                 let msg = if covariance.is_some() {
-                    format!("✓ {} columns + correlations", distributions.len())
+                    format!("{} columns + correlations", distributions.len())
                 } else {
-                    format!("✓ {} columns", distributions.len())
+                    format!("{} columns", distributions.len())
                 };
                 pb.finish_with_message(msg);
 
@@ -283,7 +283,7 @@ async fn generate_data(genome_path: &str, rows_per_table: usize, seed: Option<u6
         .context("Failed to load genome file")?;
 
     eprintln!(
-        "✓ Loaded: {} tables, {} columns",
+        "Loaded: {} tables, {} columns",
         genome.tables.len(),
         genome.total_columns()
     );
@@ -303,16 +303,16 @@ async fn generate_data(genome_path: &str, rows_per_table: usize, seed: Option<u6
     let synthesizer = Synthesizer::new(genome, config)
         .context("Failed to initialize synthesizer (check for circular dependencies)")?;
 
-    eprintln!("✓ Execution order: {:?}", synthesizer.execution_order());
+    eprintln!("Execution order: {:?}", synthesizer.execution_order());
 
-    eprintln!("⚡ Generating {} rows per table...", rows_per_table);
+    eprintln!("Generating {} rows per table...", rows_per_table);
 
     let result = synthesizer
         .generate()
         .context("Failed to generate synthetic data")?;
 
     eprintln!(
-        "✓ Generated {} total rows across {} tables",
+        "Generated {} total rows across {} tables",
         result.total_rows(),
         result.table_data.len()
     );
